@@ -1,0 +1,177 @@
+# This workflow will run tests using node and then publish a package to GitHub Packages when a release is created
+# For more information see: https://docs.github.com/en/actions/publishing-packages/publishing-nodejs-packages
+
+name: Node.js Package
+
+on:
+  release:
+    types: [created]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      - run: npm test
+
+  publish-npm:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org/
+      - run: npm ci
+      - run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{secrets.npm_token}}
+# Review of your `npm-publish.yml` workflow
+
+This is the default GitHub-generated workflow for publishing to npm. It works, but there are several issues worth fixing before you rely on it in production.
+
+## Issues & improvements
+
+### 1. `npm ci` will fail without a lockfile
+`npm ci` requires a `package-lock.json`. If yours isn't committed, switch to `npm install` — but the better fix is to commit the lockfile.
+
+### 2. Publishing runs on every release, including pre-releases
+`on: release: types: [created]` fires for drafts promoted to releases **and** pre-releases. If you use `v1.0.0-beta.1` tags, npm will publish them under the `latest` tag unless you pass `--tag`.
+
+```yaml
+- run: npm publish --tag ${{ github.event.release.prerelease && 'beta' || 'latest' }}
+```
+
+### 3. `NODE_AUTH_TOKEN` is set only on `npm publish`
+That's fine, but `setup-node` writes an `.npmrc` that reads `NODE_AUTH_TOKEN` at install time too. Some private deps will fail during `npm ci` because the token isn't exported. Move the env up to the job level:
+
+```yaml
+publish-npm:
+  needs: build
+  runs-on: ubuntu-latest
+  env:
+    NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+  steps:
+    ...
+```
+
+### 4. Secret naming is inconsistent with GitHub's convention
+`secrets.npm_token` works, but npm's own docs and most templates use `NPM_TOKEN` (uppercase). Pick one and stick with it — mixed case is easy to typo.
+
+### 5. The `build` job doesn't actually build
+The name says "build" but it only runs `npm test`. There's no `npm run build`, no artifact upload, and `publish-npm` re-checks out and re-installs everything from scratch. Two options:
+
+**Option A — keep them separate but honest:** rename `build` → `test`.
+
+**Option B — actually build once and share the artifact:**
+```yaml
+build:
+  runs-on: ubuntu-latest
+  steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 20
+        cache: npm
+    - run: npm ci
+    - run: npm test
+    - run: npm run build --if-present
+    - uses: actions/upload-artifact@v4
+      with:
+        name: dist
+        path: dist
+```
+Then `publish-npm` downloads the artifact instead of rebuilding. This avoids the "works in test, breaks in publish" class of bugs.
+
+### 6. No npm cache
+Every run downloads the full dependency tree. Add `cache: npm` to `setup-node` (as shown above) — free speedup, no downside.
+
+### 7. No `permissions:` block
+GitHub now recommends explicit permissions. For a publish workflow you typically want:
+
+```yaml
+permissions:
+  contents: read
+```
+
+(add `id-token: write` if you switch to npm provenance — see below).
+
+### 8. Consider npm provenance (OIDC) instead of a long-lived token
+Since late 2023 npm supports trusted publishing via OIDC, which removes the need for `NPM_TOKEN` entirely and gives you a signed provenance attestation:
+
+```yaml
+publish-npm:
+  needs: build
+  runs-on: ubuntu-latest
+  permissions:
+    contents: read
+    id-token: write
+  steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 20
+        registry-url: https://registry.npmjs.org/
+        cache: npm
+    - run: npm ci
+    - run: npm publish --provenance --access public
+```
+You then configure the package on npmjs.com under **Settings → Trusted Publisher** to trust this repo + workflow.
+
+## Cleaned-up version (recommended)
+
+```yaml
+name: Node.js Package
+
+on:
+  release:
+    types: [created]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  publish-npm:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # for provenance; drop if using NPM_TOKEN
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org/
+          cache: npm
+      - run: npm ci
+      - name: Publish
+        run: |
+          if [ "${{ github.event.release.prerelease }}" = "true" ]; then
+            npm publish --provenance --access public --tag beta
+          else
+            npm publish --provenance --access public
+          fi
+        # If not using OIDC:
+        # env:
+        #   NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+```
+
+## TL;DR
+The template works but is naive. At minimum: add `cache: npm`, decide whether you want one job or two, handle prereleases, and strongly consider switching to OIDC/trusted publishing so you can delete the `NPM_TOKEN` secret.
